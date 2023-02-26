@@ -1,6 +1,6 @@
 module github.com/boyter/aws-s3-bucket-purger
 
-go 1.20
+go 1.18
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.17.5
