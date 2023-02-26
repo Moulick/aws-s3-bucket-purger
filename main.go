@@ -19,6 +19,7 @@ var (
 	Bucket     string
 	Prefix     string
 	Concurrent int
+	S3pBinary  string
 )
 
 type container struct {
@@ -48,7 +49,7 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 		cmd.Options{
 			Buffered:  false,
 			Streaming: true,
-		}, "./s3p-macos-arm64",
+		}, S3pBinary,
 		"ls",
 		"--bucket",
 		Bucket,
@@ -114,6 +115,7 @@ func main() {
 
 	flag.StringVar(&Bucket, "bucket_name", "", "S3 bucket name")
 	flag.StringVar(&Prefix, "prefix", "", "S3 prefix/folder to delete")
+	flag.StringVar(&S3pBinary, "s3pBinary", "./s3p", "Path to the s3p Binary")
 	flag.IntVar(&Concurrent, "concurrent", 5, "Number of concurrent deletions to run")
 	flag.Parse()
 	if Bucket == "" {
