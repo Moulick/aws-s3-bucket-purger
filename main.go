@@ -79,7 +79,7 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 				//time.Sleep(200 * time.Microsecond)
 				s3ListQueue <- line       // Add the S3 key to the queue
 				c.inc(totalDiscovered, 1) // Increment the total discovered counter
-				log.Println(line)
+				//log.Println(line)
 			case line, open := <-s3pCmd.Stderr:
 				if !open {
 					s3pCmd.Stderr = nil
