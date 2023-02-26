@@ -1,23 +1,25 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-cmd/cmd"
+	"github.com/jnovack/flag"
 )
 
-type VersionKey struct {
-	Name      string
-	VersionId string
-}
+var (
+	Bucket     string
+	Prefix     string
+	Concurrent int
+)
 
 type container struct {
 	mu       sync.Mutex
@@ -39,32 +41,7 @@ func (c *container) get(name string) int {
 const totalDiscovered = "totalDiscovered"
 const totalDeleted = "totalDeleted"
 
-// Deletes data from bucket including versions
-// Example usage would be as follows
-// AwsRegion=ap-southeast-2 S3Bucket=my.bucket S3Prefix=191 go run main.go
-// Which will load delete all records with the bucket with the prefix 191
-func main() {
-	purge()
-}
-
-func purge() {
-	svc, err := session.NewSession(&aws.Config{
-		Region: aws.String(getEnvString("AwsRegion", ""))},
-	)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	_ = s3.New(svc)
-
-	var wg sync.WaitGroup
-	s3ListQueue := make(chan string, 99999)
-	c := container{
-		counters: map[string]int{
-			totalDiscovered: 0,
-			totalDeleted:    0,
-		},
-	}
+func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 
 	// Create Cmd with options
 	s3pCmd := cmd.NewCmdOptions(
@@ -74,15 +51,22 @@ func purge() {
 		}, "./s3p-macos-arm64",
 		"ls",
 		"--bucket",
-		"it-11613-druid-backup",
+		Bucket,
 		"--prefix",
-		"druid_pqai",
+		Prefix,
 	)
+	//s3pCmd := cmd.NewCmdOptions(
+	//	cmd.Options{
+	//		Buffered:  false,
+	//		Streaming: true,
+	//	}, "cat",
+	//	"./sample.txt",
+	//)
+	s3pCmd.Env = os.Environ()
 	// Print STDOUT and STDERR lines streaming from Cmd
-	doneChan := make(chan struct{})
 	wg.Add(1)
-	go func() {
-		defer close(doneChan)
+	go func(s3ListQueue chan string) {
+		defer wg.Done()
 		// Done when both channels have been closed
 		// https://dave.cheney.net/2013/04/30/curious-channels
 		for s3pCmd.Stdout != nil || s3pCmd.Stderr != nil {
@@ -92,26 +76,93 @@ func purge() {
 					s3pCmd.Stdout = nil
 					continue
 				}
+				//time.Sleep(200 * time.Microsecond)
+				s3ListQueue <- line       // Add the S3 key to the queue
+				c.inc(totalDiscovered, 1) // Increment the total discovered counter
 				log.Println(line)
-				s3ListQueue <- line
 			case line, open := <-s3pCmd.Stderr:
 				if !open {
 					s3pCmd.Stderr = nil
 					continue
 				}
-				log.Println(os.Stderr, line)
+				log.Fatalln(line)
 			}
 		}
-	}()
-	close(s3ListQueue)
-	wg.Done()
+		close(s3ListQueue)
+		log.Printf("s3p done, total keys discovered: %d", c.get(totalDiscovered))
+	}(s3ListQueue)
 
-	for i := 0; i < getEnvInt("LoadConcurrency", 1); i++ {
+	s3pCmd.Start()
+	log.Printf("s3p started with arguments: %s", s3pCmd.Args)
+}
+
+// Deletes data from bucket including versions
+// Example usage would be as follows
+// AwsRegion=ap-southeast-2 S3Bucket=my.bucket S3Prefix=191 go run main.go
+// Which will load delete all records with the bucket with the prefix 191
+func main() {
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	s3ListQueue := make(chan string, 1000000)
+	c := container{
+		counters: map[string]int{
+			totalDiscovered: 0,
+			totalDeleted:    0,
+		},
+	}
+
+	flag.StringVar(&Bucket, "bucket_name", "", "S3 bucket name")
+	flag.StringVar(&Prefix, "prefix", "", "S3 prefix/folder to delete")
+	flag.IntVar(&Concurrent, "concurrent", 5, "Number of concurrent deletions to run")
+	flag.Parse()
+	if Bucket == "" {
+		log.Fatalln("Bucket Name cannot be empty")
+	}
+
+	go logPrinter(&c) // Start a log printer to print the current status of the process
+	log.Printf("starting deleting files from bucket %s with prefix %s", Bucket, Prefix)
+
+	s3client := s3Init(ctx)
+
+	collectFiles(&c, &wg, s3ListQueue)
+	deleteFiles(ctx, &c, s3client, &wg, s3ListQueue)
+
+	wg.Wait() // Wait for all the go routines to finish
+
+	log.Printf("total discovered %d keys, total deleted %d keys", c.get(totalDiscovered), c.get(totalDeleted))
+	log.Printf("finished cleaning bucket %s with prefix %s", Bucket, Prefix)
+}
+
+func s3Init(ctx context.Context) *s3.Client {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Create an Amazon S3 service s3Client
+	s3Client := s3.NewFromConfig(cfg)
+	return s3Client
+}
+
+func logPrinter(c *container) {
+	for {
+		log.Printf("discovered %d keys, deleted %d keys", c.get(totalDiscovered), c.get(totalDeleted))
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func deleteFiles(ctx context.Context, c *container, s3client *s3.Client, wg *sync.WaitGroup, input chan string) {
+	routineCounter := container{counters: map[string]int{
+		"routineNumber": 0,
+	}}
+	for i := 0; i < Concurrent; i++ {
+		routineCounter.inc("routineNumber", 1)
 		wg.Add(1)
+		log.Printf("starting delete routine: %d", routineCounter.get("routineNumber"))
 		go func(input chan string) {
 			for keepGoing := true; keepGoing; {
-				objects := s3.Delete{}
-				expire := time.After(2 * time.Second)
+				var objectIds []types.ObjectIdentifier
+				expire := time.After(time.Second / 2) // The time after which we will send the delete request unless we have 1000 keys
 				for {
 					select {
 					case key, ok := <-input:
@@ -120,12 +171,10 @@ func purge() {
 							goto done
 						}
 						if key != "" {
-							objects.Objects = append(objects.Objects, &s3.ObjectIdentifier{
-								Key: aws.String(key),
-							})
+							objectIds = append(objectIds, types.ObjectIdentifier{Key: aws.String(key)})
+							//c.inc(totalDeleted, 1)
 						}
-						c.inc(totalDeleted, 1)
-						if len(objects.Objects) == 1000 {
+						if len(objectIds) == 1000 {
 							goto done
 						}
 					case <-expire:
@@ -133,57 +182,21 @@ func purge() {
 					}
 				}
 			done:
-				//_, err := s3client.DeleteObjects(&s3.DeleteObjectsInput{
-				//	Bucket: aws.String(getEnvString("S3Bucket", "")),
-				//	Delete: objects,
-				//})
-				time.Sleep(10 * time.Millisecond)
-				log.Printf("deleting %d keys", len(objects.Objects))
-				if err != nil {
-					log.Println(err)
+				if len(objectIds) > 0 {
+					_, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+						Bucket: aws.String(Bucket),
+						Delete: &types.Delete{Objects: objectIds, Quiet: true},
+					})
+					if err != nil {
+						log.Println(err)
+					}
+					//time.Sleep(1000 * time.Millisecond)
+					log.Printf("deleting keys count: %d", len(objectIds))
+					c.inc(totalDeleted, len(objectIds))
 				}
 			}
 			wg.Done()
-		}(s3ListQueue)
+			routineCounter.inc("routineNumber", -1)
+		}(input)
 	}
-
-	go func() {
-		for {
-			log.Println(fmt.Sprintf("Discovered %d keys, deleted %d keys", c.get(totalDiscovered), c.get(totalDeleted)))
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-
-	log.Println(fmt.Sprintf("starting::bucket:%s::prefix:%s", getEnvString("S3Bucket", ""), getEnvString("S3Prefix", "")))
-	// Run and wait for Cmd to return, discard Status
-	s3pCmd.Start()
-	wg.Wait()
-	log.Println(fmt.Sprintf("Total Discovered %d keys, Total deleted %d keys",
-		c.get(totalDiscovered),
-		c.get(totalDeleted),
-	))
-	log.Println(fmt.Sprintf("finished::bucket:%s::prefix:%s", getEnvString("S3Bucket", ""), getEnvString("S3Prefix", "")))
-
-	// Wait for goroutine to print everything
-	<-doneChan
-
-}
-
-func getEnvString(variable string, def string) string {
-	val := os.Getenv(variable)
-	if val != "" {
-		return val
-	}
-	return def
-}
-
-func getEnvInt(variable string, def int) int {
-	tmp := os.Getenv(variable)
-	if tmp != "" {
-		val, err := strconv.Atoi(tmp)
-		if err == nil {
-			return val
-		}
-	}
-	return def
 }
