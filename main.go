@@ -49,13 +49,10 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 		cmd.Options{
 			Buffered:  false,
 			Streaming: true,
-		}, S3pBinary,
-		"ls",
-		"--bucket",
-		Bucket,
-		"--prefix",
-		Prefix,
-	)
+		}, S3pBinary, "ls", "--bucket", Bucket)
+	if Prefix != "" {
+		s3pCmd.Args = append(s3pCmd.Args, "--prefix", Prefix)
+	}
 	//s3pCmd := cmd.NewCmdOptions(
 	//	cmd.Options{
 	//		Buffered:  false,
