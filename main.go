@@ -128,6 +128,7 @@ func main() {
 	deleteFiles(ctx, &c, s3client, &wg, s3ListQueue)
 
 	wg.Wait() // Wait for all the go routines to finish
+	close(s3ListQueue)
 
 	log.Printf("total discovered %d keys, total deleted %d keys in %s", c.get(totalDiscovered), c.get(totalDeleted), time.Since(TotalStart))
 	log.Printf("finished cleaning bucket %s with prefix %s", Bucket, Prefix)
