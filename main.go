@@ -16,11 +16,11 @@ import (
 )
 
 var (
-	Bucket     string
-	Prefix     string
-	Concurrent int
-	S3pBinary  string
-	TotalStart time.Time
+	Bucket      string
+	Prefix      string
+	Concurrency int
+	S3pBinary   string
+	TotalStart  time.Time
 )
 
 type container struct {
@@ -40,11 +40,12 @@ func (c *container) get(name string) int {
 	return c.counters[name]
 }
 
-const totalDiscovered = "totalDiscovered"
-const totalDeleted = "totalDeleted"
+const (
+	totalDiscovered = "totalDiscovered"
+	totalDeleted    = "totalDeleted"
+)
 
 func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
-
 	// Create Cmd with options
 	s3pCmd := cmd.NewCmdOptions(
 		cmd.Options{
@@ -75,10 +76,10 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 					s3pCmd.Stdout = nil
 					continue
 				}
-				//time.Sleep(200 * time.Microsecond)
+				// time.Sleep(200 * time.Microsecond)
 				s3ListQueue <- line       // Add the S3 key to the queue
 				c.inc(totalDiscovered, 1) // Increment the total discovered counter
-				//log.Println(line)
+				// log.Println(line)
 			case line, open := <-s3pCmd.Stderr:
 				if !open {
 					s3pCmd.Stderr = nil
@@ -113,7 +114,7 @@ func main() {
 	flag.StringVar(&Bucket, "bucket_name", "", "S3 bucket name")
 	flag.StringVar(&Prefix, "prefix", "", "S3 prefix/folder to delete")
 	flag.StringVar(&S3pBinary, "s3pBinary", "./s3p", "Path to the s3p Binary")
-	flag.IntVar(&Concurrent, "concurrent", 3, "Number of concurrent deletions to run")
+	flag.IntVar(&Concurrency, "concurrency", 3, "Number of concurrent deletions to run")
 	flag.Parse()
 	if Bucket == "" {
 		log.Fatalln("Bucket Name cannot be empty")
@@ -161,7 +162,7 @@ func deleteFiles(ctx context.Context, c *container, s3client *s3.Client, wg *syn
 	routineCounter := container{counters: map[string]int{
 		"routineNumber": 0,
 	}}
-	for i := 0; i < Concurrent; i++ {
+	for i := 0; i < Concurrency; i++ {
 		routineCounter.inc("routineNumber", 1)
 		wg.Add(1)
 		log.Printf("starting delete routine: %d", routineCounter.get("routineNumber"))
@@ -178,7 +179,7 @@ func deleteFiles(ctx context.Context, c *container, s3client *s3.Client, wg *syn
 						}
 						if key != "" {
 							objectIds = append(objectIds, types.ObjectIdentifier{Key: aws.String(key)})
-							//c.inc(totalDeleted, 1)
+							// c.inc(totalDeleted, 1)
 						}
 						if len(objectIds) == 1000 {
 							goto done
@@ -199,7 +200,7 @@ func deleteFiles(ctx context.Context, c *container, s3client *s3.Client, wg *syn
 							s3ListQueue <- *objectId.Key // adding the keys back to the queue
 						}
 					}
-					//time.Sleep(1000 * time.Millisecond)
+					// time.Sleep(1000 * time.Millisecond)
 					log.Printf("deleting keys count: %d", len(objectIds))
 					c.inc(totalDeleted, len(objectIds))
 				}
