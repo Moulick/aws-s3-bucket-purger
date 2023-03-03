@@ -87,7 +87,6 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 				log.Fatalln(line)
 			}
 		}
-		close(s3ListQueue)
 		log.Printf("s3p done, total keys discovered: %d", c.get(totalDiscovered))
 	}(s3ListQueue)
 
