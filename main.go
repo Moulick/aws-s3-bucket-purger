@@ -135,7 +135,12 @@ func main() {
 }
 
 func s3Init(ctx context.Context) *s3.Client {
-	cfg, err := config.LoadDefaultConfig(ctx)
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRetryMode(aws.RetryModeAdaptive),
+		config.WithRetryMaxAttempts(5),
+		config.WithLogConfigurationWarnings(true),
+		config.WithS3UseARNRegion(true),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
