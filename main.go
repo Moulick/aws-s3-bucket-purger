@@ -20,7 +20,7 @@ var (
 	Prefix      string
 	Concurrency int
 	S3pBinary   string
-	TotalStart  time.Time
+	startTime   time.Time
 )
 
 type container struct {
@@ -28,12 +28,28 @@ type container struct {
 	counters map[string]int
 }
 
-func (c *container) inc(name string, amt int) {
+// Increments the counter for the given name by 1.
+func (c *container) inc(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counters[name]++
+}
+
+// Decrements the counter for the given name by 1.
+func (c *container) dec(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counters[name]--
+}
+
+// Changes the counter for the given name by given amount.
+func (c *container) add(name string, amt int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.counters[name] = c.counters[name] + amt
 }
 
+// Returns the current value of the counter for the given name.
 func (c *container) get(name string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -43,7 +59,34 @@ func (c *container) get(name string) int {
 const (
 	totalDiscovered = "totalDiscovered"
 	totalDeleted    = "totalDeleted"
+	threadNumber    = "threadNumber"
 )
+
+// Returns a s3.Client with the default configuration
+func s3Init(ctx context.Context) *s3.Client {
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRetryMode(aws.RetryModeAdaptive), // try the new Adaptive retry mode
+		config.WithRetryMaxAttempts(5),
+		config.WithLogConfigurationWarnings(true),
+		config.WithS3UseARNRegion(true), // Use the region from the A
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Create an Amazon S3 service s3Client
+	s3Client := s3.NewFromConfig(cfg)
+	return s3Client
+}
+
+// Continuously prints the current state of the counters
+func logPrinter(c *container) {
+	startTime = time.Now()
+	for {
+		log.Printf("discovered %d keys, deleted %d keys in %s", c.get(totalDiscovered), c.get(totalDeleted), time.Since(startTime).Round(time.Second))
+		time.Sleep(500 * time.Millisecond)
+	}
+}
 
 func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 	// Create Cmd with options
@@ -77,8 +120,8 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 					continue
 				}
 				// time.Sleep(200 * time.Microsecond)
-				s3ListQueue <- line       // Add the S3 key to the queue
-				c.inc(totalDiscovered, 1) // Increment the total discovered counter
+				s3ListQueue <- line    // Add the S3 key to the queue
+				c.inc(totalDiscovered) // Increment the total discovered counter
 				// log.Println(line)
 			case line, open := <-s3pCmd.Stderr:
 				if !open {
@@ -93,6 +136,59 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 
 	s3pCmd.Start()
 	log.Printf("s3p started with arguments: %s", s3pCmd.Args)
+}
+
+func deleteFiles(ctx context.Context, c *container, s3client *s3.Client, wg *sync.WaitGroup, s3ListQueue chan string) {
+	threadCounter := container{counters: map[string]int{
+		threadNumber: 0,
+	}}
+	for i := 0; i < Concurrency; i++ {
+		threadCounter.inc(threadNumber)
+		wg.Add(1)
+		log.Printf("starting delete thread: %d", threadCounter.get(threadNumber))
+		go func(s3ListQueue chan string) {
+			for keepGoing := true; keepGoing; {
+				var objectIds []types.ObjectIdentifier
+				expire := time.After(time.Second / 2) // The time after which we will send the delete request unless we have 1000 keys
+				for {
+					select {
+					case key, ok := <-s3ListQueue:
+						if !ok {
+							keepGoing = false
+							goto done
+						}
+						if key != "" {
+							objectIds = append(objectIds, types.ObjectIdentifier{Key: aws.String(key)})
+							// c.inc(totalDeleted, 1)
+						}
+						if len(objectIds) == 1000 {
+							goto done
+						}
+					case <-expire:
+						goto done
+					}
+				}
+			done:
+				if len(objectIds) > 0 {
+					_, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+						Bucket: aws.String(Bucket),
+						Delete: &types.Delete{Objects: objectIds, Quiet: true},
+					})
+					if err != nil {
+						log.Println(err)
+						for _, objectId := range objectIds {
+							s3ListQueue <- *objectId.Key // adding the keys back to the queue
+						}
+					}
+					// time.Sleep(1000 * time.Millisecond)
+					log.Printf("deleting keys count: %d", len(objectIds))
+					c.add(totalDeleted, len(objectIds))
+				}
+			}
+			wg.Done()
+			threadCounter.dec("routineNumber")
+		}(s3ListQueue)
+	}
 }
 
 // Deletes data from bucket including versions
@@ -131,82 +227,6 @@ func main() {
 	wg.Wait() // Wait for all the go routines to finish
 	close(s3ListQueue)
 
-	log.Printf("total discovered %d keys, total deleted %d keys in %s", c.get(totalDiscovered), c.get(totalDeleted), time.Since(TotalStart))
+	log.Printf("total discovered %d keys, total deleted %d keys in %s", c.get(totalDiscovered), c.get(totalDeleted), time.Since(startTime))
 	log.Printf("finished cleaning bucket %s with prefix %s", Bucket, Prefix)
-}
-
-func s3Init(ctx context.Context) *s3.Client {
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRetryMode(aws.RetryModeAdaptive),
-		config.WithRetryMaxAttempts(5),
-		config.WithLogConfigurationWarnings(true),
-		config.WithS3UseARNRegion(true),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Create an Amazon S3 service s3Client
-	s3Client := s3.NewFromConfig(cfg)
-	return s3Client
-}
-
-func logPrinter(c *container) {
-	TotalStart = time.Now()
-	for {
-		log.Printf("discovered %d keys, deleted %d keys in %s", c.get(totalDiscovered), c.get(totalDeleted), time.Since(TotalStart).Round(time.Second))
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
-func deleteFiles(ctx context.Context, c *container, s3client *s3.Client, wg *sync.WaitGroup, s3ListQueue chan string) {
-	routineCounter := container{counters: map[string]int{
-		"routineNumber": 0,
-	}}
-	for i := 0; i < Concurrency; i++ {
-		routineCounter.inc("routineNumber", 1)
-		wg.Add(1)
-		log.Printf("starting delete routine: %d", routineCounter.get("routineNumber"))
-		go func(s3ListQueue chan string) {
-			for keepGoing := true; keepGoing; {
-				var objectIds []types.ObjectIdentifier
-				expire := time.After(time.Second / 2) // The time after which we will send the delete request unless we have 1000 keys
-				for {
-					select {
-					case key, ok := <-s3ListQueue:
-						if !ok {
-							keepGoing = false
-							goto done
-						}
-						if key != "" {
-							objectIds = append(objectIds, types.ObjectIdentifier{Key: aws.String(key)})
-							// c.inc(totalDeleted, 1)
-						}
-						if len(objectIds) == 1000 {
-							goto done
-						}
-					case <-expire:
-						goto done
-					}
-				}
-			done:
-				if len(objectIds) > 0 {
-					_, err := s3client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-						Bucket: aws.String(Bucket),
-						Delete: &types.Delete{Objects: objectIds, Quiet: true},
-					})
-					if err != nil {
-						log.Println(err)
-						for _, objectId := range objectIds {
-							s3ListQueue <- *objectId.Key // adding the keys back to the queue
-						}
-					}
-					// time.Sleep(1000 * time.Millisecond)
-					log.Printf("deleting keys count: %d", len(objectIds))
-					c.inc(totalDeleted, len(objectIds))
-				}
-			}
-			wg.Done()
-			routineCounter.inc("routineNumber", -1)
-		}(s3ListQueue)
-	}
 }
