@@ -132,6 +132,10 @@ func collectFiles(c *container, wg *sync.WaitGroup, s3ListQueue chan string) {
 			}
 		}
 		log.Printf("s3p done, total keys discovered: %d", c.get(totalDiscovered))
+		if c.get(totalDiscovered) == 0 {
+			log.Println("no keys to delete, exiting")
+			os.Exit(0)
+		}
 	}(s3ListQueue)
 
 	s3pCmd.Start()
@@ -210,7 +214,7 @@ func main() {
 	flag.StringVar(&Bucket, "bucket_name", "", "S3 bucket name")
 	flag.StringVar(&Prefix, "prefix", "", "S3 prefix/folder to delete")
 	flag.StringVar(&S3pBinary, "s3pBinary", "./s3p", "Path to the s3p Binary")
-	flag.IntVar(&Concurrency, "concurrency", 3, "Number of concurrent deletions to run")
+	flag.IntVar(&Concurrency, "concurrency", 5, "Number of concurrent deletions to run")
 	flag.Parse()
 	if Bucket == "" {
 		log.Fatalln("Bucket Name cannot be empty")
